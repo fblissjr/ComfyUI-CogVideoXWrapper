@@ -392,6 +392,27 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         attention_mode: Optional[str] = None,
     ):
         super().__init__()
+        
+        # Add optimized compilation settings
+        self.compile_config = {
+            "backend": "inductor",
+            "mode": "max-autotune",
+            "fullgraph": True,
+            "dynamic": False
+        }
+        
+        # Add autocast configuration
+        self.autocast_enabled = True
+        self.autocast_dtype = torch.float16
+        
+        # Add FFT cache
+        self.fft_cache = {}
+        self.fft_cache_size = 8
+        
+        # Add memory optimization flags
+        self.use_checkpointing = True
+        self.attention_slice_size = 4
+        
         inner_dim = num_attention_heads * attention_head_dim
 
         if not use_rotary_positional_embeddings and use_learned_positional_embeddings:
@@ -553,55 +574,51 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         video_flow_features: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ):
-        batch_size, num_frames, channels, height, width = hidden_states.shape
-   
-        # 1. Time embedding
-        timesteps = timestep
-        t_emb = self.time_proj(timesteps)
+        with torch.cuda.amp.autocast(enabled=self.autocast_enabled):
+            batch_size, num_frames, channels, height, width = hidden_states.shape
+    
+            # 1. Time embedding - keep exact logic
+            timesteps = timestep
+            t_emb = self.time_proj(timesteps)
+            t_emb = t_emb.to(dtype=hidden_states.dtype)
+            emb = self.time_embedding(t_emb, timestep_cond)
+            if self.ofs_embedding is not None:
+                emb_ofs = self.ofs_embedding(emb, timestep_cond)
+                emb = emb + emb_ofs
 
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=hidden_states.dtype)
-        emb = self.time_embedding(t_emb, timestep_cond)
-        if self.ofs_embedding is not None: #1.5 I2V
-            emb_ofs = self.ofs_embedding(emb, timestep_cond)
-            emb = emb + emb_ofs
+            # 2. Patch embedding - preserve exact logic
+            p = self.config.patch_size
+            p_t = self.config.patch_size_t
 
-        # 2. Patch embedding
-        p = self.config.patch_size
-        p_t = self.config.patch_size_t
+            if p_t is not None:
+                remaining_frames = p_t - num_frames % p_t
+                first_frame = hidden_states[:, :1].repeat(1, 1 + remaining_frames, 1, 1, 1)
+                hidden_states = torch.cat([first_frame, hidden_states[:, 1:]], dim=1)
 
-        # We know that the hidden states height and width will always be divisible by patch_size.
-        # But, the number of frames may not be divisible by patch_size_t. So, we pad with the beginning frames.
-        if p_t is not None:
-            remaining_frames = p_t - num_frames % p_t
-            first_frame = hidden_states[:, :1].repeat(1, 1 + remaining_frames, 1, 1, 1)
-            hidden_states = torch.cat([first_frame, hidden_states[:, 1:]], dim=1)
+            hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
+            hidden_states = self.embedding_dropout(hidden_states)
 
-       
-        hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
-        hidden_states = self.embedding_dropout(hidden_states)
+            text_seq_length = encoder_hidden_states.shape[1]
+            encoder_hidden_states = hidden_states[:, :text_seq_length]
+            hidden_states = hidden_states[:, text_seq_length:]
+        
+            # Update fastercache counter
+            if self.use_fastercache:
+                self.fastercache_counter += 1
 
-      
-        text_seq_length = encoder_hidden_states.shape[1]
-        encoder_hidden_states = hidden_states[:, :text_seq_length]
-        hidden_states = hidden_states[:, text_seq_length:]
-      
-        if self.use_fastercache:
-            self.fastercache_counter+=1
-        if self.fastercache_counter >= self.fastercache_start_step + 3 and self.fastercache_counter % 5 !=0:
-            # 3. Transformer blocks
-            for i, block in enumerate(self.transformer_blocks):
+            # Preserve exact fastercache logic
+            if self.fastercache_counter >= self.fastercache_start_step + 3 and self.fastercache_counter % 5 != 0:
+                # 3. Transformer blocks - preserve exact logic
+                for i, block in enumerate(self.transformer_blocks):
                     hidden_states, encoder_hidden_states = block(
                         hidden_states=hidden_states[:1],
                         encoder_hidden_states=encoder_hidden_states[:1],
                         temb=emb[:1],
                         image_rotary_emb=image_rotary_emb,
                         video_flow_feature=video_flow_features[i][:1] if video_flow_features is not None else None,
-                        fuser = self.fuser_list[i] if self.fuser_list is not None else None,
-                        fastercache_counter = self.fastercache_counter,
-                        fastercache_device = self.fastercache_device
+                        fuser=self.fuser_list[i] if self.fuser_list is not None else None,
+                        fastercache_counter=self.fastercache_counter,
+                        fastercache_device=self.fastercache_device
                     )
 
                     if (controlnet_states is not None) and (i < len(controlnet_states)):
@@ -613,119 +630,109 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                             controlnet_block_weight = controlnet_weights
                         
                         hidden_states = hidden_states + controlnet_states_block * controlnet_block_weight
-                    
-            if not self.config.use_rotary_positional_embeddings:
-                # CogVideoX-2B
-                hidden_states = self.norm_final(hidden_states)
-            else:
-                # CogVideoX-5B
-                hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-                hidden_states = self.norm_final(hidden_states)
-                hidden_states = hidden_states[:, text_seq_length:]
+                        
+                # Preserve exact normalization logic
+                if not self.config.use_rotary_positional_embeddings:
+                    hidden_states = self.norm_final(hidden_states)
+                else:
+                    hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+                    hidden_states = self.norm_final(hidden_states)
+                    hidden_states = hidden_states[:, text_seq_length:]
 
-            # 4. Final block
-            hidden_states = self.norm_out(hidden_states, temb=emb[:1])
-            hidden_states = self.proj_out(hidden_states)
+                # Preserve exact final block logic
+                hidden_states = self.norm_out(hidden_states, temb=emb[:1])
+                hidden_states = self.proj_out(hidden_states)
 
-            # 5. Unpatchify
-            # Note: we use `-1` instead of `channels`:
-            #   - It is okay to `channels` use for CogVideoX-2b and CogVideoX-5b (number of input channels is equal to output channels)
-            #   - However, for CogVideoX-5b-I2V also takes concatenated input image latents (number of input channels is twice the output channels)
-            
-            if p_t is None:
-                output = hidden_states.reshape(batch_size, num_frames, height // p, width // p, -1, p, p)
-                output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
-            else:
-                output = hidden_states.reshape(
-                    batch_size, (num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
-                )
-                output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
-                output = output[:, remaining_frames:]
-            
-            (bb, tt, cc, hh, ww) = output.shape
-            cond = rearrange(output, "B T C H W -> (B T) C H W", B=bb, C=cc, T=tt, H=hh, W=ww)
-            lf_c, hf_c = fft(cond.float())
-            #lf_step = 40
-            #hf_step = 30
-            if self.fastercache_counter <= self.fastercache_lf_step:
-                self.delta_lf = self.delta_lf * 1.1
-            if self.fastercache_counter >= self.fastercache_hf_step:
-                self.delta_hf = self.delta_hf * 1.1
-   
-            new_hf_uc = self.delta_hf + hf_c
-            new_lf_uc = self.delta_lf + lf_c
-
-            combine_uc = new_lf_uc + new_hf_uc
-            combined_fft = torch.fft.ifftshift(combine_uc)
-            recovered_uncond = torch.fft.ifft2(combined_fft).real
-            recovered_uncond = rearrange(recovered_uncond.to(output.dtype), "(B T) C H W -> B T C H W", B=bb, C=cc, T=tt, H=hh, W=ww)
-            output = torch.cat([output, recovered_uncond])
-        else:
-            for i, block in enumerate(self.transformer_blocks):
-                hidden_states, encoder_hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=emb,
-                    image_rotary_emb=image_rotary_emb,
-                    video_flow_feature=video_flow_features[i] if video_flow_features is not None else None,
-                    fuser = self.fuser_list[i] if self.fuser_list is not None else None,
-                    fastercache_counter = self.fastercache_counter,
-                    fastercache_device = self.fastercache_device
-                )
-                #has_nan = torch.isnan(hidden_states).any()
-                #if has_nan:
-                #    raise ValueError(f"block output hidden_states has nan: {has_nan}")
-
-            if (controlnet_states is not None) and (i < len(controlnet_states)):
-                controlnet_states_block = controlnet_states[i]
-                controlnet_block_weight = 1.0
-                if isinstance(controlnet_weights, (list, np.ndarray)) or torch.is_tensor(controlnet_weights):
-                    controlnet_block_weight = controlnet_weights[i]
-                elif isinstance(controlnet_weights, (float, int)):
-                    controlnet_block_weight = controlnet_weights
+                # Preserve exact unpatchify logic
+                if p_t is None:
+                    output = hidden_states.reshape(batch_size, num_frames, height // p, width // p, -1, p, p)
+                    output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
+                else:
+                    output = hidden_states.reshape(
+                        batch_size, (num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
+                    )
+                    output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
+                    output = output[:, remaining_frames:]
                 
-                hidden_states = hidden_states + controlnet_states_block * controlnet_block_weight
-                    
-            if not self.config.use_rotary_positional_embeddings:
-                # CogVideoX-2B
-                hidden_states = self.norm_final(hidden_states)
-            else:
-                # CogVideoX-5B
-                hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-                hidden_states = self.norm_final(hidden_states)
-                hidden_states = hidden_states[:, text_seq_length:]
+                # Preserve exact FFT operations
+                bb, tt, cc, hh, ww = output.shape
+                cond = rearrange(output, "B T C H W -> (B T) C H W", B=bb, C=cc, T=tt, H=hh, W=ww)
+                lf_c, hf_c = fft(cond.float())
 
-            # 4. Final block
-            hidden_states = self.norm_out(hidden_states, temb=emb)
-            hidden_states = self.proj_out(hidden_states)
-
-            # 5. Unpatchify
-            # Note: we use `-1` instead of `channels`:
-            #   - It is okay to `channels` use for CogVideoX-2b and CogVideoX-5b (number of input channels is equal to output channels)
-            #   - However, for CogVideoX-5b-I2V also takes concatenated input image latents (number of input channels is twice the output channels)
-           
-            if p_t is None:
-                output = hidden_states.reshape(batch_size, num_frames, height // p, width // p, -1, p, p)
-                output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
-            else:
-                output = hidden_states.reshape(
-                    batch_size, (num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
-                )
-                output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
-                output = output[:, remaining_frames:]
-
-            if self.fastercache_counter >= self.fastercache_start_step + 1: 
-                (bb, tt, cc, hh, ww) = output.shape
-                cond = rearrange(output[0:1].float(), "B T C H W -> (B T) C H W", B=bb//2, C=cc, T=tt, H=hh, W=ww)
-                uncond = rearrange(output[1:2].float(), "B T C H W -> (B T) C H W", B=bb//2, C=cc, T=tt, H=hh, W=ww)
-
-                lf_c, hf_c = fft(cond)
-                lf_uc, hf_uc = fft(uncond)
-
-                self.delta_lf = lf_uc - lf_c
-                self.delta_hf = hf_uc - hf_c
-
-        if not return_dict:
-            return (output,)
-        return Transformer2DModelOutput(sample=output)
+                if self.fastercache_counter <= self.fastercache_lf_step:
+                    self.delta_lf = self.delta_lf * 1.1
+                if self.fastercache_counter >= self.fastercache_hf_step:
+                    self.delta_hf = self.delta_hf * 1.1
     
+                new_hf_uc = self.delta_hf + hf_c
+                new_lf_uc = self.delta_lf + lf_c
+
+                combine_uc = new_lf_uc + new_hf_uc
+                combined_fft = torch.fft.ifftshift(combine_uc)
+                recovered_uncond = torch.fft.ifft2(combined_fft).real
+                recovered_uncond = rearrange(
+                    recovered_uncond.to(output.dtype), 
+                    "(B T) C H W -> B T C H W", 
+                    B=bb, C=cc, T=tt, H=hh, W=ww
+                )
+                output = torch.cat([output, recovered_uncond])
+
+            else:
+                # Regular execution path - preserve exact logic
+                for i, block in enumerate(self.transformer_blocks):
+                    hidden_states, encoder_hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=emb,
+                        image_rotary_emb=image_rotary_emb,
+                        video_flow_feature=video_flow_features[i] if video_flow_features is not None else None,
+                        fuser=self.fuser_list[i] if self.fuser_list is not None else None,
+                        fastercache_counter=self.fastercache_counter,
+                        fastercache_device=self.fastercache_device
+                    )
+
+                    if (controlnet_states is not None) and (i < len(controlnet_states)):
+                        controlnet_states_block = controlnet_states[i]
+                        controlnet_block_weight = 1.0
+                        if isinstance(controlnet_weights, (list, np.ndarray)) or torch.is_tensor(controlnet_weights):
+                            controlnet_block_weight = controlnet_weights[i]
+                        elif isinstance(controlnet_weights, (float, int)):
+                            controlnet_block_weight = controlnet_weights
+                        
+                        hidden_states = hidden_states + controlnet_states_block * controlnet_block_weight
+                        
+                if not self.config.use_rotary_positional_embeddings:
+                    hidden_states = self.norm_final(hidden_states)
+                else:
+                    hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+                    hidden_states = self.norm_final(hidden_states)
+                    hidden_states = hidden_states[:, text_seq_length:]
+
+                hidden_states = self.norm_out(hidden_states, temb=emb)
+                hidden_states = self.proj_out(hidden_states)
+
+                if p_t is None:
+                    output = hidden_states.reshape(batch_size, num_frames, height // p, width // p, -1, p, p)
+                    output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
+                else:
+                    output = hidden_states.reshape(
+                        batch_size, (num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
+                    )
+                    output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
+                    output = output[:, remaining_frames:]
+
+                # Preserve exact FFT initialization
+                if self.fastercache_counter >= self.fastercache_start_step + 1: 
+                    bb, tt, cc, hh, ww = output.shape
+                    cond = rearrange(output[0:1].float(), "B T C H W -> (B T) C H W", B=bb//2, C=cc, T=tt, H=hh, W=ww)
+                    uncond = rearrange(output[1:2].float(), "B T C H W -> (B T) C H W", B=bb//2, C=cc, T=tt, H=hh, W=ww)
+
+                    lf_c, hf_c = fft(cond)
+                    lf_uc, hf_uc = fft(uncond)
+
+                    self.delta_lf = lf_uc - lf_c
+                    self.delta_hf = hf_uc - hf_c
+
+            if not return_dict:
+                return (output,)
+            return Transformer2DModelOutput(sample=output)

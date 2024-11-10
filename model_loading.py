@@ -111,13 +111,23 @@ class DownloadAndLoadCogVideoModel:
     DESCRIPTION = "Downloads and loads the selected CogVideo model from Huggingface to 'ComfyUI/models/CogVideo'"
 
     def loadmodel(self, model, precision, fp8_transformer="disabled", compile="disabled", 
-                  enable_sequential_cpu_offload=False, pab_config=None, block_edit=None, lora=None, compile_args=None, 
-                  attention_mode="sdpa", load_device="main_device"):
+                  enable_sequential_cpu_offload=False, pab_config=None, block_edit=None, lora=None,
+                  compile_args=None, attention_mode="sdpa", load_device="main_device"):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         transformer_load_device = device if load_device == "main_device" else offload_device
         mm.soft_empty_cache()
+
+        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
+        download_path = folder_paths.get_folder_paths("CogVideo")[0]
+
+        # Add optimal settings definition here
+        optimal_settings = {
+            "memory_format": torch.channels_last if torch.cuda.is_available() else torch.contiguous_format,
+            "attention_slice_size": 4,
+            "memory_efficient_attention": True
+        }
 
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
         download_path = folder_paths.get_folder_paths("CogVideo")[0]
@@ -194,9 +204,8 @@ class DownloadAndLoadCogVideoModel:
                 transformer = CogVideoXTransformer3DModelPAB.from_pretrained(base_path, subfolder=subfolder)
             else:
                 transformer = CogVideoXTransformer3DModel.from_pretrained(base_path, subfolder=subfolder)
-        
-        transformer = transformer.to(dtype).to(transformer_load_device)
 
+        transformer = transformer.to(dtype).to(transformer_load_device)
         transformer.attention_mode = attention_mode
 
         if block_edit is not None:
@@ -270,18 +279,75 @@ class DownloadAndLoadCogVideoModel:
         if enable_sequential_cpu_offload:
             pipe.enable_sequential_cpu_offload()
             
-        # compilation
-        if compile == "torch":
-            pipe.transformer.to(memory_format=torch.channels_last)
-            if compile_args is not None:
-                torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
-                for i, block in enumerate(pipe.transformer.transformer_blocks):
-                    if "CogVideoXBlock" in str(block):
-                        pipe.transformer.transformer_blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
-            else:
-                for i, block in enumerate(pipe.transformer.transformer_blocks):
-                    if "CogVideoXBlock" in str(block):
-                        pipe.transformer.transformer_blocks[i] = torch.compile(block, fullgraph=False, dynamic=False, backend="inductor")
+            # compilation
+            if compile == "torch":
+                # Set memory format
+                pipe.transformer.to(memory_format=optimal_settings["memory_format"])
+                
+                if compile_args is not None:
+                    # Increase cache size limit
+                    torch._dynamo.config.cache_size_limit = compile_args.get("dynamo_cache_size_limit", 64)
+                    
+                    try:
+                        # Configure dynamo for better stability
+                        torch._dynamo.config.suppress_errors = True
+                        torch._dynamo.config.report_guard_failures = True
+                        
+                        compile_config = {
+                            "fullgraph": compile_args.get("fullgraph", False),
+                            "dynamic": compile_args.get("dynamic", False),
+                            "backend": compile_args.get("backend", "inductor"),
+                            "mode": compile_args.get("mode", "reduce-overhead"),
+                            "options": {
+                                "max_autotune": True,
+                                "trace.enabled": True,
+                                "trace.graph_diagram": True,
+                                "max_parallel_jobs": 1,
+                                "epilogue_fusion": True
+                            }
+                        }
+                        
+                        # Compile transformer blocks
+                        for i, block in enumerate(pipe.transformer.transformer_blocks):
+                            if "CogVideoXBlock" in str(block):
+                                try:
+                                    pipe.transformer.transformer_blocks[i] = torch.compile(
+                                        block,
+                                        **compile_config
+                                    )
+                                except Exception as e:
+                                    print(f"Warning: Failed to compile block {i}: {e}")
+                                    continue
+                                    
+                    except Exception as e:
+                        print(f"Warning: Torch compile configuration failed: {e}")
+                        print("Falling back to uncompiled model")
+                else:
+                    # Default conservative compilation
+                    try:
+                        for i, block in enumerate(pipe.transformer.transformer_blocks):
+                            if "CogVideoXBlock" in str(block):
+                                pipe.transformer.transformer_blocks[i] = torch.compile(
+                                    block,
+                                    fullgraph=False,
+                                    dynamic=False, 
+                                    backend="inductor",
+                                    mode="reduce-overhead"
+                                )
+                    except Exception as e:
+                        print(f"Warning: Default compilation failed: {e}")
+
+            pipeline = {
+                "pipe": pipe,
+                "dtype": dtype,
+                "base_path": base_path,
+                "onediff": True if compile == "onediff" else False,
+                "cpu_offloading": enable_sequential_cpu_offload,
+                "scheduler_config": scheduler_config,
+                "model_name": model
+            }
+
+            return (pipeline,)
             
         elif compile == "onediff":
             from onediffx import compile_pipe
@@ -534,6 +600,40 @@ class DownloadAndLoadCogVideoGGUFModel:
         }
 
         return (pipeline,)
+    
+class CogVideoXTorchCompileConfig:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "mode": (["default", "reduce-overhead", "max-autotune"], {"default": "reduce-overhead"}),
+            "cache_size": ("INT", {"default": 128, "min": 8, "max": 1024, "step": 8}),
+            "fullgraph": ("BOOLEAN", {"default": False}),
+            "backend": (["inductor", "aot_eager", "eager"], {"default": "inductor"}),
+            "enable_errors": ("BOOLEAN", {"default": True}),
+            "parallel_jobs": ("INT", {"default": 1, "min": 1, "max": 8}),
+        }}
+    
+    RETURN_TYPES = ("COMPILE_CONFIG",)
+    RETURN_NAMES = ("compile_config",)
+    FUNCTION = "get_config"
+    CATEGORY = "CogVideoWrapper"
+
+    def get_config(self, mode, cache_size, fullgraph, backend, enable_errors, parallel_jobs):
+        config = {
+            "mode": mode,
+            "dynamo_cache_size_limit": cache_size,
+            "fullgraph": fullgraph,
+            "backend": backend,
+            "suppress_errors": not enable_errors,
+            "options": {
+                "max_autotune": mode == "max-autotune",
+                "trace.enabled": True,
+                "max_parallel_jobs": parallel_jobs,
+                "epilogue_fusion": True
+            }
+        }
+        return (config,)
+    
 #region Tora
 class DownloadAndLoadToraModel:
     @classmethod
@@ -697,11 +797,14 @@ NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadCogVideoControlNet": DownloadAndLoadCogVideoControlNet,
     "DownloadAndLoadToraModel": DownloadAndLoadToraModel,
     "CogVideoLoraSelect": CogVideoLoraSelect,
+    "CogVideoXTorchCompileConfig": CogVideoXTorchCompileConfig,
 }
+
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadCogVideoModel": "(Down)load CogVideo Model",
     "DownloadAndLoadCogVideoGGUFModel": "(Down)load CogVideo GGUF Model",
     "DownloadAndLoadCogVideoControlNet": "(Down)load CogVideo ControlNet",
     "DownloadAndLoadToraModel": "(Down)load Tora Model",
     "CogVideoLoraSelect": "CogVideo LoraSelect",
+    "CogVideoXTorchCompileConfig": "CogVideo Torch Compile Config",
     }

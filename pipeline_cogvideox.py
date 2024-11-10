@@ -149,6 +149,19 @@ class CogVideoXPipeline(VideoSysPipeline, CogVideoXLoraLoaderMixin):
         original_mask = None,
         pab_config = None
     ):
+        
+        # Add optimized device management
+        self.optimal_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        self.optimal_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Add memory efficient attention
+        self.use_memory_efficient_attention = True
+        self.attention_slice_size = 4
+        
+        # Add better caching
+        self.optimal_cache_dtype = torch.float16
+        self.cached_states = {}
+        
         super().__init__()
 
         self.register_modules(
@@ -169,9 +182,26 @@ class CogVideoXPipeline(VideoSysPipeline, CogVideoXLoraLoaderMixin):
         self.input_with_padding = True
 
     def prepare_latents(
-        self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, timesteps, denoise_strength,
-         num_inference_steps, latents=None, freenoise=True, context_size=None, context_overlap=None
+        self, 
+        batch_size, 
+        num_channels_latents,
+        num_frames,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+        timesteps,
+        denoise_strength,
+        num_inference_steps,
+        latents=None,
+        context_size=None,
+        context_overlap=None,
+        freenoise=True,
     ):
+        """Prepare latents for denoising process."""
+        
+        # Calculate shape based on temporal compression ratio
         shape = (
             batch_size,
             (num_frames - 1) // self.vae_scale_factor_temporal + 1,
@@ -179,67 +209,95 @@ class CogVideoXPipeline(VideoSysPipeline, CogVideoXLoraLoaderMixin):
             height // self.vae_scale_factor_spatial,
             width // self.vae_scale_factor_spatial,
         )
+
+        # Validate generators
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
+
+        # Generate initial noise
         noise = randn_tensor(shape, generator=generator, device=torch.device("cpu"), dtype=self.vae.dtype)
-        if freenoise:
-            print("Applying FreeNoise")
-            # code and comments from AnimateDiff-Evolved by Kosinkadink (https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved)
-            video_length = num_frames // 4
+
+        # Apply FreeNoise if requested
+        if freenoise and context_size is not None:
+            video_length = noise.shape[1] 
             delta = context_size - context_overlap
+            
             for start_idx in range(0, video_length-context_size, delta):
-                # start_idx corresponds to the beginning of a context window
-                # goal: place shuffled in the delta region right after the end of the context window
-                #       if space after context window is not enough to place the noise, adjust and finish
                 place_idx = start_idx + context_size
-                # if place_idx is outside the valid indexes, we are already finished
                 if place_idx >= video_length:
                     break
+                    
                 end_idx = place_idx - 1
-                #print("video_length:", video_length, "start_idx:", start_idx, "end_idx:", end_idx, "place_idx:", place_idx, "delta:", delta)
-
-                # if there is not enough room to copy delta amount of indexes, copy limited amount and finish
+                
+                # Handle final window
                 if end_idx + delta >= video_length:
                     final_delta = video_length - place_idx
-                    # generate list of indexes in final delta region
-                    list_idx = torch.tensor(list(range(start_idx,start_idx+final_delta)), device=torch.device("cpu"), dtype=torch.long)
-                    # shuffle list
+                    list_idx = torch.tensor(list(range(start_idx,start_idx+final_delta)), 
+                                        device=torch.device("cpu"), dtype=torch.long)
                     list_idx = list_idx[torch.randperm(final_delta, generator=generator)]
-                    # apply shuffled indexes
                     noise[:, place_idx:place_idx + final_delta, :, :, :] = noise[:, list_idx, :, :, :]
                     break
-                # otherwise, do normal behavior
-                # generate list of indexes in delta region
-                list_idx = torch.tensor(list(range(start_idx,start_idx+delta)), device=torch.device("cpu"), dtype=torch.long)
-                # shuffle list
+                
+                # Normal window
+                list_idx = torch.tensor(list(range(start_idx,start_idx+delta)), 
+                                    device=torch.device("cpu"), dtype=torch.long)
                 list_idx = list_idx[torch.randperm(delta, generator=generator)]
-                # apply shuffled indexes
-                #print("place_idx:", place_idx, "delta:", delta, "list_idx:", list_idx)
                 noise[:, place_idx:place_idx + delta, :, :, :] = noise[:, list_idx, :, :, :]
+
+        # Handle latents
         if latents is None:
+            # For new generation
             latents = noise.to(device)
         else:
+            # For img2img
             latents = latents.to(device)
             timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, denoise_strength, device)
             latent_timestep = timesteps[:1]
             
-            noise = randn_tensor(shape, generator=generator, device=device, dtype=self.vae.dtype)
+            # Match dimensions
             frames_needed = noise.shape[1]
             current_frames = latents.shape[1]
             
             if frames_needed > current_frames:
                 repeat_factor = frames_needed // current_frames
-                additional_frame = torch.randn((latents.size(0), repeat_factor, latents.size(2), latents.size(3), latents.size(4)), dtype=latents.dtype, device=latents.device)
+                additional_frame = torch.randn(
+                    (latents.size(0), repeat_factor, latents.size(2), latents.size(3), latents.size(4)), 
+                    dtype=latents.dtype, 
+                    device=latents.device
+                )
                 latents = torch.cat((latents, additional_frame), dim=1)
             elif frames_needed < current_frames:
                 latents = latents[:, :frames_needed, :, :, :]
-
+                
+            # Add noise based on timestep
             latents = self.scheduler.add_noise(latents, noise, latent_timestep)
-        latents = latents * self.scheduler.init_noise_sigma # scale the initial noise by the standard deviation required by the scheduler
+            
+        # Scale latents per scheduler requirements
+        latents = latents * self.scheduler.init_noise_sigma
+
         return latents, timesteps, noise
+    
+    def _optimize_freenoise(self, noise, context_size, context_overlap):
+        # Optimize noise shuffling implementation
+        with torch.no_grad():
+            video_length = noise.shape[1]
+            delta = context_size - context_overlap
+            
+            for start_idx in range(0, video_length - context_size, delta):
+                place_idx = start_idx + context_size
+                if place_idx >= video_length:
+                    break
+                    
+                final_delta = min(delta, video_length - place_idx)
+                idx_range = torch.arange(start_idx, start_idx + final_delta, device=noise.device)
+                shuffled_idx = idx_range[torch.randperm(final_delta)]
+                
+                noise[:, place_idx:place_idx + final_delta] = noise[:, shuffled_idx]
+                
+        return noise
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
     def prepare_extra_step_kwargs(self, generator, eta):

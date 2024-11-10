@@ -153,32 +153,28 @@ class CogVideoTransformerEdit:
 class CogVideoXTorchCompileSettings:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required": { 
-                "backend": (["inductor","cudagraphs"], {"default": "inductor"}),
-                "fullgraph": ("BOOLEAN", {"default": False, "tooltip": "Enable full graph mode"}),
-                "mode": (["default", "max-autotune", "max-autotune-no-cudagraphs", "reduce-overhead"], {"default": "default"}),
-                "dynamic": ("BOOLEAN", {"default": False, "tooltip": "Enable dynamic mode"}),
-                "dynamo_cache_size_limit": ("INT", {"default": 64, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.cache_size_limit"}),
-            },
-        }
-    RETURN_TYPES = ("COMPILEARGS",)
+        return {"required": { 
+            "backend": (["inductor","cudagraphs"], {"default": "inductor"}),
+            "mode": (["default", "reduce-overhead", "max-autotune"], {"default": "reduce-overhead"}),
+            "fullgraph": ("BOOLEAN", {"default": False}),
+            "dynamic": ("BOOLEAN", {"default": False}),
+            "dynamo_cache_size_limit": ("INT", {"default": 128, "min": 8, "max": 1024, "step": 8}),
+        }}
+    
+    RETURN_TYPES = ("COMPILE_CONFIG",)
     RETURN_NAMES = ("torch_compile_args",)
-    FUNCTION = "loadmodel"
-    CATEGORY = "MochiWrapper"
-    DESCRIPTION = "torch.compile settings, when connected to the model loader, torch.compile of the selected layers is attempted. Requires Triton and torch 2.5.0 is recommended"
+    FUNCTION = "get_config"
+    CATEGORY = "CogVideoWrapper"
 
-    def loadmodel(self, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit):
-
-        compile_args = {
-            "backend": backend,
-            "fullgraph": fullgraph,
+    def get_config(self, backend, mode, fullgraph, dynamic, dynamo_cache_size_limit):
+        config = {
             "mode": mode,
-            "dynamic": dynamic,
             "dynamo_cache_size_limit": dynamo_cache_size_limit,
+            "fullgraph": fullgraph,
+            "dynamic": dynamic,
+            "backend": backend
         }
-
-        return (compile_args, )
+        return (config,)
     
 #region TextEncode    
 class CogVideoEncodePrompt:
@@ -756,26 +752,33 @@ class CogVideoXFasterCache:
                 "start_step": ("INT", {"default": 15, "min": 0, "max": 1024, "step": 1}),
                 "hf_step": ("INT", {"default": 30, "min": 0, "max": 1024, "step": 1}),
                 "lf_step": ("INT", {"default": 40, "min": 0, "max": 1024, "step": 1}),
-                "cache_device": (["main_device", "offload_device", "cuda:1"], {"default": "main_device", "tooltip": "The device to use for the cache, main_device is on GPU and uses a lot of VRAM"}),
+                "cache_device": (["main_device", "offload_device", "cuda:1"], {
+                    "default": "main_device",
+                    "tooltip": "Device for cache storage"
+                }),
             },
         }
 
+    # Add missing RETURN_TYPES
     RETURN_TYPES = ("FASTERCACHEARGS",)
-    RETURN_NAMES = ("fastercache", )
+    RETURN_NAMES = ("fastercache",)
     FUNCTION = "args"
     CATEGORY = "CogVideoWrapper"
 
     def args(self, start_step, hf_step, lf_step, cache_device):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
+        
         if cache_device == "cuda:1":
             device = torch.device("cuda:1")
+            
         fastercache = {
-            "start_step" : start_step,
-            "hf_step" : hf_step,
-            "lf_step" : lf_step,
-            "cache_device" : device if cache_device != "offload_device" else offload_device
+            "start_step": start_step,
+            "hf_step": hf_step,
+            "lf_step": lf_step,
+            "cache_device": device if cache_device != "offload_device" else offload_device
         }
+        
         return (fastercache,)
 
 #region Sampler    
